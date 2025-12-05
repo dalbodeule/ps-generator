@@ -1,96 +1,78 @@
-from typing import Any, Dict, List
+from typing import Dict, List
 import os
 import logging
-from langchain_openai import ChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
+
 from agents import AuthoringState, AuthoringConfig, build_authoring_graph
 from agents.tools import Toolbelt
 from dotenv import load_dotenv
 
+from tools.llm import real_llm
+from tools.shell import noop_shell
+from tools.image import gemini_image
+from tools import fs
+
 
 load_dotenv()
 
-def _real_llm(prompt: str, system: str | None = None) -> Any:
-    logging.info("Starting LLM step...")
-    llm = ChatOpenAI(
-        model="gpt-5",
-        temperature=0.2,
-    )
-
-    messages = []
-    if system:
-        messages.append(SystemMessage(content=system))
-    messages.append(HumanMessage(content=prompt))
-
-    response = llm.invoke(messages)
-    logging.info("LLM step completed")
-    return response.content
-
-
-def _noop_shell(commands: List[str]) -> Dict[str, Any]:
-    logging.info("Running shell step...")
-    return {"returncode": 0, "stdout": "\n".join(commands), "stderr": ""}
-
-
-def _memfs_writer_factory(storage: Dict[str, str]):
-    def _write_file(path: str, content: str) -> None:
-        storage[path] = content
-    return _write_file
-
-
-def _memfs_reader_factory(storage: Dict[str, str]):
-    def _read_file(path: str) -> str:
-        return storage.get(path, "")
-    return _read_file
-
-
-def _memfs_listdir_factory(storage: Dict[str, str]):
-    def _list_dir(prefix: str) -> List[str]:
-        return [p for p in storage.keys() if p.startswith(prefix)]
-    return _list_dir
-
-
-def _memfs_ensuredir(_: str) -> None:
-    return None
-
-
-def _fake_image(_: str, __: str) -> bytes:
-    return b"\x89PNG\r\n\x1a\n"  # PNG 헤더 바이트
 
 
 def main() -> None:
-    # 0) Setup OpenAI API
+    """엔트리 포인트.
+
+    - API 키 설정
+    - LangGraph 스타일 그래프 생성
+    - Toolbelt 구성 (LLM, 셸, FS, 이미지 생성기)
+    - 최종 결과를 메모리 FS에서 출력
+    """
+    # 0) Setup API keys (OpenAI for LLM, Gemini for nano banana pro images)
     if not os.getenv("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = input("Enter your OpenAI API key: ")
+    if not os.getenv("GEMINI_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = input("Enter your Gemini API key (for nano banana pro images): ")
 
     # 1) Initialize problem configuration
     description = input("Enter problem description: ")
+    # Optional explicit problem id (used for ./problems/{id} directory naming)
+    problem_id_raw = input("Enter numeric problem id (leave blank for 'pending'): ").strip()
+    problem_id: int | None
+    if problem_id_raw.isdigit():
+        problem_id = int(problem_id_raw)
+    else:
+        problem_id = None
+
+    # Language and example programming language from environment (.env)
+    # LANG: target natural language for problem statements (default: EN)
+    # PROGM_LANG: example programming language label (default: C++/17)
+    lang_env = os.getenv("LANG", "EN")
+    language = lang_env.lower()
+    example_prog_lang = os.getenv("PROGM_LANG", "C++/17")
 
     # 2) LangGraph style pipeline setup
     graph = build_authoring_graph()
 
-    # 3) Prepare Toolbelt (memory filesystem/dummy runner)
-    storage: Dict[str, str] = {}
+    # 3) Prepare Toolbelt (real filesystem + dummy runner)
     tb = Toolbelt(
-        llm_chat=_real_llm,
-        run_shell=_noop_shell,
-        write_file=_memfs_writer_factory(storage),
-        read_file=_memfs_reader_factory(storage),
-        list_dir=_memfs_listdir_factory(storage),
-        ensure_dir=_memfs_ensuredir,
-        generate_image=_fake_image,
+        llm_chat=real_llm,
+        run_shell=noop_shell,
+        write_file=fs.write_file,
+        read_file=fs.read_file,
+        list_dir=fs.list_dir,
+        ensure_dir=fs.ensure_dir,
+        generate_image=gemini_image,
+        write_bytes=fs.write_bytes,
     )
 
     # 4) Initialize state and config
     state = AuthoringState(description)
-    cfg = AuthoringConfig()
+    cfg = AuthoringConfig(
+        target_language=language,
+        example_prog_lang=example_prog_lang,
+        problem_id=problem_id,
+    )
     final_state = graph(state, cfg, tb)
 
-    # 5) Output generated problem files
-    for path, content in storage.items():
-        print(f"Generated {path}:")
-        print(content)
-        print("-" * 80)
+    # 5) Output notice of generated problem files
+    print("Problems have been written under ./problems (e.g., ./problems/{id}/problem.md).")
 
 
 if __name__ == "__main__":

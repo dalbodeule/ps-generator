@@ -1,5 +1,6 @@
 import json
 from typing import Dict, Any, Tuple
+from itertools import zip_longest
 
 from .prompts import (
     REQUIREMENT_ANALYSIS_PROMPT,
@@ -37,14 +38,23 @@ def _call_llm_json(toolbelt: Toolbelt, prompt: str, system: str | None = None) -
 
 def step_requirement(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> AuthoringState:
     payload = f"{REQUIREMENT_ANALYSIS_PROMPT}\n\nUser seed:\n{state.user_seed}"
-    state.requirement = _call_llm_json(tb, payload, "You are a precise problem analyst.")
+    system = (
+        "You are a precise problem analyst. "
+        f"Write all natural-language text in the language indicated by code '{cfg.target_language}' "
+        "(for example: 'en' for English, 'ko' for Korean)."
+    )
+    state.requirement = _call_llm_json(tb, payload, system)
     return state
 
 
 def step_algo(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> AuthoringState:
     context = json.dumps(state.requirement, ensure_ascii=False)
     payload = f"{ALGO_ANALYSIS_PROMPT}\n\nRequirement JSON:\n{context}"
-    state.algo = _call_llm_json(tb, payload, "You are an algorithm taxonomist.")
+    system = (
+        "You are an algorithm taxonomist. "
+        f"Write all natural-language text in the language indicated by code '{cfg.target_language}'."
+    )
+    state.algo = _call_llm_json(tb, payload, system)
     return state
 
 
@@ -52,9 +62,15 @@ def step_statement(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) ->
     ctx = {
         "requirement": state.requirement,
         "algo": state.algo,
+        "language": cfg.target_language,
     }
     payload = f"{PROBLEM_STATEMENT_PROMPT}\n\nContext:\n{json.dumps(ctx, ensure_ascii=False)}"
-    state.statement = _call_llm_json(tb, payload, "You write clear ICPC-style statements.")
+    system = (
+        "You write clear ICPC-style statements. "
+        f"Write the entire problem statement and all natural-language text in the language "
+        f"indicated by code '{cfg.target_language}' (e.g., 'en', 'ko')."
+    )
+    state.statement = _call_llm_json(tb, payload, system)
     return state
 
 
@@ -64,20 +80,36 @@ def step_codegen(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> A
         "algo": state.algo,
         "statement": state.statement,
         "cpp_std": cfg.cpp_std,
+        "example_prog_lang": cfg.example_prog_lang,
     }
     payload = f"{CODEGEN_PROMPT}\n\nContext:\n{json.dumps(ctx, ensure_ascii=False)}"
-    state.code = _call_llm_json(tb, payload, "You output only the requested JSON.")
+    system = (
+        "You output only the requested JSON. "
+        "Prefer to generate the solution in the example programming language indicated in the context "
+        f"(field 'example_prog_lang', currently '{cfg.example_prog_lang}'), "
+        "while still following any explicit rules in the prompt."
+    )
+    state.code = _call_llm_json(tb, payload, system)
     # persist sources
     solve_code = state.code.get("solve_code", "")
     needs_judge = bool(state.code.get("needs_judge", False))
-    problem_id = state.requirement.get("id") or 0
-    solve_path = f"/problem/{problem_id or 'pending'}/solve.cpp"
-    tb.ensure_dir(f"/problem/{problem_id or 'pending'}")
+    # Resolve a stable problem id: prefer cfg.problem_id, then any id from previous steps,
+    # and finally fall back to the string "pending".
+    problem_id = (
+        cfg.problem_id
+        or state.requirement.get("id")
+        or state.algo.get("id")
+        or state.code.get("id")
+        or "pending"
+    )
+    base_dir = f"problems/{problem_id}"
+    solve_path = f"{base_dir}/solve.cpp"
+    tb.ensure_dir(base_dir)
     tb.write_file(solve_path, solve_code)
     state.solve_source_path = solve_path
     if needs_judge:
         judge_code = state.code.get("judge_code", "")
-        judge_path = f"/problem/{problem_id or 'pending'}/judge.py"
+        judge_path = f"{base_dir}/judge.py"
         tb.write_file(judge_path, judge_code)
         state.judge_source_path = judge_path
     return state
@@ -87,9 +119,15 @@ def step_casegen(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> A
     ctx = {
         "constraints": state.statement.get("constraints", ""),
         "examples": state.statement.get("examples", []),
+        "language": cfg.target_language,
     }
     payload = f"{CASEGEN_PROMPT}\n\nContext:\n{json.dumps(ctx, ensure_ascii=False)}"
-    result = _call_llm_json(tb, payload, "You create diverse and valid test cases.")
+    system = (
+        "You create diverse and valid test cases. "
+        "Any explanatory natural-language text must use the same language as the problem statement, "
+        f"indicated by code '{cfg.target_language}'."
+    )
+    result = _call_llm_json(tb, payload, system)
     state.io = ProblemIOBundle(
         example_inputs=result.get("example_inputs", []),
         grading_inputs=result.get("grading_inputs", []),
@@ -134,13 +172,23 @@ def step_image(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> Aut
     payload = f"{IMAGE_GEN_PROMPT}\n\nContext:\n{json.dumps(ctx, ensure_ascii=False)}"
     prompts = _call_llm_json(tb, payload, "Return JSON only.").get("prompts", [])
     images: list[Tuple[str, int]] = []
+    # Use the same stable problem id resolution as in other steps
+    problem_id = (
+        cfg.problem_id
+        or state.requirement.get("id")
+        or state.algo.get("id")
+        or state.code.get("id")
+        or "pending"
+    )
     for i, p in enumerate(prompts):
         img_bytes = tb.generate_image(cfg.image_model, p)
-        rel = f"/problem/{state.requirement.get('id') or 'pending'}/images/img_{i + 1}.png"
-        tb.ensure_dir(f"/problem/{state.requirement.get('id') or 'pending'}/images")
-        # naive write via write_file expecting str; we base64 bypass not allowed, so assume caller writes bytes
-        # Provide alternate path: inject write_file that handles bytes or implement separate writer upstream.
-        # Here we just record intended path.
+        img_base = f"problems/{problem_id}/images"
+        rel = f"{img_base}/img_{i + 1}.png"
+        tb.ensure_dir(img_base)
+        # 실제 파일 저장: write_bytes가 주입되어 있으면 바이너리로 저장한다.
+        write_bytes = getattr(tb, "write_bytes", None)
+        if callable(write_bytes):
+            write_bytes(rel, img_bytes)
         images.append((rel, len(img_bytes)))
     state.images = {"count": len(images), "paths": [p for p, _ in images]}
     return state
@@ -158,15 +206,26 @@ def step_review(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> Au
             "interactive": state.requirement.get("is_interactive", False),
             "special_judge": state.requirement.get("has_special_judge", False),
         },
+        "language": cfg.target_language,
     }
     payload = f"{REVIEW_PROMPT}\n\nContext:\n{json.dumps(ctx, ensure_ascii=False)}"
-    state.review = _call_llm_json(tb, payload, "You are a careful editor.")
+    system = (
+        "You are a careful editor. "
+        f"Write all issues and fix_suggestions in the language indicated by code '{cfg.target_language}'."
+    )
+    state.review = _call_llm_json(tb, payload, system)
     return state
 
 
 def step_persist(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> AuthoringState:
-    pid = state.requirement.get("id") or state.algo.get("id") or state.code.get("id") or 0
-    base = f"/tmp/problem/{pid or 'pending'}"
+    pid = (
+        cfg.problem_id
+        or state.requirement.get("id")
+        or state.algo.get("id")
+        or state.code.get("id")
+        or "pending"
+    )
+    base = f"problems/{pid}"
     ctx = {
         "problem_id": pid,
         "base_dir": base,
@@ -177,14 +236,14 @@ def step_persist(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> A
             "example_outputs": state.io.example_outputs,
             "grading_outputs": state.io.grading_outputs,
         },
+        "language": cfg.target_language,
     }
     payload = f"{PERSIST_PROMPT}\n\nContext:\n{json.dumps(ctx, ensure_ascii=False)}"
     state.persist_plan = _call_llm_json(tb, payload, "Output only JSON.")
-    # Write problem.md and cases skeleton
+    # Write problem.md and per-case files
     tb.ensure_dir(f"{base}/cases")
     problem_md_path = f"{base}/problem.md"
-    cases_in_path = f"{base}/cases/[caseID].in"
-    cases_out_path = f"{base}/cases/[caseID].out"
+    cases_dir = f"{base}/cases"
     # Render markdown
     st = state.statement
     examples = st.get("examples", [])
@@ -222,7 +281,13 @@ def step_persist(state: AuthoringState, cfg: AuthoringConfig, tb: Toolbelt) -> A
         for p in state.images["paths"]:
             md.append(f"![figure]({p})")
     tb.write_file(problem_md_path, "\n".join(md))
-    # Cases content (aggregate grading inputs; outputs may be filled later by judge/runner)
-    tb.write_file(cases_in_path, "\n\n".join(state.io.grading_inputs))
-    tb.write_file(cases_out_path, "\n\n".join(state.io.grading_outputs or []))
+    # Cases content: split each grading case into its own {caseID}.in / {caseID}.out
+    for idx, (inp, out) in enumerate(
+        zip_longest(state.io.grading_inputs, state.io.grading_outputs or [], fillvalue=""),
+        start=1,
+    ):
+        case_in_path = f"{cases_dir}/case_{idx}.in"
+        case_out_path = f"{cases_dir}/case_{idx}.out"
+        tb.write_file(case_in_path, inp)
+        tb.write_file(case_out_path, out)
     return state

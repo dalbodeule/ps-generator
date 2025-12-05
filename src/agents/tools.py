@@ -10,9 +10,10 @@ Expected injected tools (callables):
 - list_dir(path: str) -> list[str]
 - ensure_dir(path: str) -> None
 - generate_image(model: str, prompt: str) -> bytes
+- write_bytes(path: str, data: bytes) -> None (optional, for images/binary)
 """
 
-from typing import Callable, Dict, Any, List
+from typing import Callable, Dict, Any, List, Optional
 
 
 class Toolbelt:
@@ -25,6 +26,7 @@ class Toolbelt:
         list_dir: Callable[[str], List[str]],
         ensure_dir: Callable[[str], None],
         generate_image: Callable[[str, str], bytes],
+        write_bytes: Optional[Callable[[str, bytes], None]] = None,
     ) -> None:
         self.llm_chat = llm_chat
         self.run_shell = run_shell
@@ -33,3 +35,5 @@ class Toolbelt:
         self.list_dir = list_dir
         self.ensure_dir = ensure_dir
         self.generate_image = generate_image
+        # Optional binary writer, used for persisting images if available
+        self.write_bytes = write_bytes

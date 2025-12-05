@@ -16,8 +16,13 @@ class AuthoringConfig:
     temperature: float = 0.2
     problem_id: Optional[int] = None  # auto-increment upstream
     gcc_tool_path: str = "/src/tools/gcc_build.sh"  # to be created by tools
-    image_model: str = "openai-nano-banana"
+    # Default image model for generation (OpenAI Nano Banana Pro)
+    image_model: str = "openai-nano-banana-pro"
     cpp_std: str = "c++17"
+    # Language for problem statement and natural-language text ("en", "ko", ...)
+    target_language: str = "en"
+    # Preferred example programming language for solutions (e.g., "C++/17", "Python 3.12")
+    example_prog_lang: str = "C++/17"
 
 
 @dataclass
